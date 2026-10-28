@@ -1,170 +1,258 @@
-param([switch]$Update)
+
+param(
+    [switch]$Update,
+    [switch]$Daemon
+)
 
 $ErrorActionPreference = 'Stop'
 
-# Replace YOUR_GITHUB_USERNAME before publishing this repository.
-$RepoOwner = 'YOUR_GITHUB_USERNAME'
+$RepoOwner = 'greattastychips'
 $RepoName = 'fsociety'
-if ($RepoOwner -eq 'YOUR_GITHUB_USERNAME') {
-    throw "Edit install.ps1 and replace YOUR_GITHUB_USERNAME with your GitHub username before publishing."
-}
 $RawBase = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/main"
+$WallpaperUrl = 'https://rare-gallery.com/thumbs/4501587-elliot-mr-robot-face-mr.-robot-tv-fsociety-simple-background-black-background-monochrome.png'
 
-$Base = Join-Path $env:LOCALAPPDATA '1234'
-$Bin = Join-Path $Base 'bin'
-$Image = Join-Path $Base '1234.png'
-$State = Join-Path $Base 'enabled.txt'
-$Monitor = Join-Path $Base 'monitor.ps1'
-$Control = Join-Path $Base 'control.ps1'
-$Shim = Join-Path $Bin 'fsociety.cmd'
+$InstallDir = Join-Path $env:LOCALAPPDATA '1234'
+$WallpaperPath = Join-Path $InstallDir '1234.png'
+$ScriptPath = Join-Path $InstallDir 'fsociety.ps1'
+$ConfigPath = Join-Path $InstallDir 'config.json'
+$CommandPath = Join-Path $InstallDir 'fsociety.cmd'
+$StartupDir = [Environment]::GetFolderPath('Startup')
+$StartupPath = Join-Path $StartupDir 'fsociety.cmd'
 
-New-Item -ItemType Directory -Path $Base, $Bin -Force | Out-Null
-# Keep the application folder out of normal File Explorer views.
-try { & attrib.exe +h $Base } catch {}
-
-if (-not (Test-Path $State)) {
-    Set-Content -LiteralPath $State -Value 'on' -Encoding ASCII
+function Write-Info([string]$Message) {
+    Write-Host "[fsociety] $Message"
 }
 
-if (-not (Test-Path $Image)) {
-    $ImageUrl = 'https://rare-gallery.com/thumbs/4501587-elliot-mr-robot-face-mr.-robot-tv-fsociety-simple-background-black-background-monochrome.png'
-    Invoke-WebRequest -Uri $ImageUrl -OutFile $Image
-    $bytes = [System.IO.File]::ReadAllBytes($Image)
-    $signature = '89504E470D0A1A0A'
-    $actual = ([BitConverter]::ToString($bytes[0..7])).Replace('-', '')
-    if ($bytes.Length -lt 1000 -or $actual -ne $signature) {
-        Remove-Item -LiteralPath $Image -Force -ErrorAction SilentlyContinue
-        throw 'Wallpaper download did not return a valid PNG. Check the image URL and try again.'
+function Get-Config {
+    $defaults = @{
+        Enabled = $true
+        Interval = 1
     }
+
+    if (Test-Path $ConfigPath) {
+        try {
+            $saved = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+            if ($null -ne $saved.Enabled) {
+                $defaults.Enabled = [bool]$saved.Enabled
+            }
+            if ($null -ne $saved.Interval) {
+                $defaults.Interval = [Math]::Max(1, [int]$saved.Interval)
+            }
+        } catch {}
+    }
+
+    return $defaults
 }
 
-$monitorText = @'
-$ErrorActionPreference = 'SilentlyContinue'
-$root = Join-Path $env:LOCALAPPDATA '1234'
-$image = Join-Path $root '1234.png'
-$state = Join-Path $root 'enabled.txt'
+function Save-Config($Config) {
+    $Config | ConvertTo-Json | Set-Content -Path $ConfigPath -Encoding UTF8
+}
 
-Add-Type -TypeDefinition @"
+function Set-Wallpaper([string]$Path) {
+    if (-not (Test-Path $Path)) {
+        throw "Wallpaper file not found: $Path"
+    }
+
+    Add-Type @'
 using System;
-using System.Text;
 using System.Runtime.InteropServices;
-public static class FsocietyWallpaperNative {
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    public static extern bool SystemParametersInfo(uint action, uint param, StringBuilder value, uint flags);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    public static extern bool SystemParametersInfo(uint action, uint param, string value, uint flags);
-    public static string GetWallpaper() {
-        StringBuilder b = new StringBuilder(1024);
-        SystemParametersInfo(0x0073, (uint)b.Capacity, b, 0);
-        return b.ToString();
-    }
-    public static bool SetWallpaper(string path) {
-        return SystemParametersInfo(20, 0, path, 3);
+public class WallpaperApi {
+    [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+    public static extern int SystemParametersInfo(
+        int action, int param, string path, int flags
+    );
+}
+'@ -ErrorAction SilentlyContinue
+
+    $result = [WallpaperApi]::SystemParametersInfo(20, 0, $Path, 3)
+    if ($result -eq 0) {
+        throw 'Windows could not apply the wallpaper.'
     }
 }
-"@
 
-$createdNew = $false
-$mutex = New-Object System.Threading.Mutex($true, 'Local\Fsociety1234Monitor', [ref]$createdNew)
-if (-not $createdNew) {
-    $mutex.Dispose()
+function Get-CurrentWallpaper {
+    try {
+        Get-ItemPropertyValue -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper
+    } catch {
+        return ''
+    }
+}
+
+function Download-Wallpaper {
+    Invoke-WebRequest -Uri $WallpaperUrl -OutFile $WallpaperPath -UseBasicParsing
+
+    if (-not (Test-Path $WallpaperPath) -or (Get-Item $WallpaperPath).Length -lt 1024) {
+        throw 'Wallpaper download failed or returned an invalid file.'
+    }
+}
+
+function Install-Utility {
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+
+    $folder = Get-Item $InstallDir
+    $folder.Attributes = $folder.Attributes -bor [IO.FileAttributes]::Hidden
+
+    if (-not (Test-Path $WallpaperPath)) {
+        Download-Wallpaper
+    }
+
+    if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
+        Copy-Item -LiteralPath $PSCommandPath -Destination $ScriptPath -Force
+    }
+
+    $config = Get-Config
+    Save-Config $config
+
+    @'
+@echo off
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%LOCALAPPDATA%\1234\fsociety.ps1" -Daemon
+'@ | Set-Content -Path $StartupPath -Encoding ASCII
+
+    @'
+@echo off
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\1234\fsociety.ps1" %*
+'@ | Set-Content -Path $CommandPath -Encoding ASCII
+
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if (($userPath -split ';') -notcontains $InstallDir) {
+        $newPath = (@($userPath.TrimEnd(';'), $InstallDir) | Where-Object { $_ }) -join ';'
+        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+    }
+
+    Set-Wallpaper $WallpaperPath
+
+    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
+        '-NoLogo',
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', "`"$ScriptPath`"",
+        '-Daemon'
+    )
+
+    Write-Info 'Installed.'
+}
+
+function Start-Daemon {
+    $mutex = New-Object Threading.Mutex($false, 'Local\fsociety-wallpaper-daemon')
+    if (-not $mutex.WaitOne(0)) {
+        return
+    }
+
+    try {
+        while ($true) {
+            $config = Get-Config
+
+            if ($config.Enabled) {
+                try {
+                    if ((Get-CurrentWallpaper) -ne $WallpaperPath) {
+                        Set-Wallpaper $WallpaperPath
+                    }
+                } catch {}
+            }
+
+            Start-Sleep -Seconds ([Math]::Max(1, $config.Interval))
+        }
+    } finally {
+        $mutex.ReleaseMutex()
+        $mutex.Dispose()
+    }
+}
+
+function Show-Help {
+    @'
+fsociety commands:
+  fsociety on
+  fsociety off
+  fsociety status
+  fsociety set
+  fsociety time <seconds>
+  fsociety update
+  fsociety help
+  fsociety uninstall
+'@ | Write-Output
+}
+
+if ($Daemon) {
+    Start-Daemon
     exit
 }
 
-try {
-    while ($true) {
-        if (-not (Test-Path $state) -or (Get-Content -LiteralPath $state -Raw).Trim() -ne 'on') {
-            break
-        }
-        if (Test-Path $image) {
-            $current = [FsocietyWallpaperNative]::GetWallpaper()
-            if (-not [string]::Equals($current, $image, [StringComparison]::OrdinalIgnoreCase)) {
-                [FsocietyWallpaperNative]::SetWallpaper($image) | Out-Null
-            }
-        }
-        Start-Sleep -Seconds 1
+$command = if ($args.Count -gt 0) { [string]$args[0] } else { 'install' }
+
+switch ($command.ToLowerInvariant()) {
+    'install' {
+        Install-Utility
     }
-} finally {
-    try { $mutex.ReleaseMutex() } catch {}
-    $mutex.Dispose()
-}
-'@
 
-$controlText = @'
-param([string]$Action = 'status')
-$ErrorActionPreference = 'Stop'
-$root = Join-Path $env:LOCALAPPDATA '1234'
-$state = Join-Path $root 'enabled.txt'
-$rawBase = '__RAW_BASE__'
-$monitor = Join-Path $root 'monitor.ps1'
-
-switch ($Action.ToLowerInvariant()) {
     'on' {
-        Set-Content -LiteralPath $state -Value 'on' -Encoding ASCII
-        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$monitor`"")
-        Write-Output 'fsociety enabled.'
+        $config = Get-Config
+        $config.Enabled = $true
+        Save-Config $config
+        Set-Wallpaper $WallpaperPath
+        Write-Info 'Enabled.'
     }
+
     'off' {
-        Set-Content -LiteralPath $state -Value 'off' -Encoding ASCII
-        Write-Output 'fsociety disabled.'
+        $config = Get-Config
+        $config.Enabled = $false
+        Save-Config $config
+        Write-Info 'Disabled.'
     }
+
     'status' {
-        if (Test-Path $state) { Get-Content -LiteralPath $state } else { Write-Output 'not installed' }
+        $config = Get-Config
+        Write-Output "Enabled: $($config.Enabled)"
+        Write-Output "Interval: $($config.Interval) second(s)"
+        Write-Output "Wallpaper: $WallpaperPath"
+        Write-Output "Current wallpaper: $(Get-CurrentWallpaper)"
     }
+
     'set' {
-        Set-Content -LiteralPath $state -Value 'on' -Encoding ASCII
-        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$monitor`"")
+        Set-Wallpaper $WallpaperPath
+        Write-Info 'Wallpaper applied.'
     }
-    'update' {
-        $temp = Join-Path $env:TEMP 'fsociety-install-update.ps1'
-        Invoke-WebRequest -Uri "$rawBase/install.ps1" -OutFile $temp
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $temp -Update
-        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
-    }
-    'uninstall' {
-        Set-Content -LiteralPath $state -Value 'off' -Encoding ASCII -ErrorAction SilentlyContinue
-        Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name '1234Wallpaper' -ErrorAction SilentlyContinue
-        $bin = Join-Path $root 'bin'
-        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        if ($userPath) {
-            $newPath = (($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ne $bin.TrimEnd('\') }) -join ';')
-            [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+
+    'time' {
+        if ($args.Count -lt 2) {
+            Write-Output 'Usage: fsociety time <seconds>'
+            exit 1
         }
-        Start-Sleep -Milliseconds 1200
-        Remove-Item -LiteralPath $root -Recurse -Force
-        Write-Output 'fsociety uninstalled. Open a new Terminal window.'
+
+        $seconds = 0
+        if (-not [int]::TryParse([string]$args[1], [ref]$seconds) -or $seconds -lt 1 -or $seconds -gt 86400) {
+            throw 'Enter a whole number from 1 to 86400.'
+        }
+
+        $config = Get-Config
+        $config.Interval = $seconds
+        Save-Config $config
+        Write-Info "Interval set to $seconds second(s)."
     }
+
+    'update' {
+        $temp = Join-Path $env:TEMP 'fsociety-update.ps1'
+        Invoke-WebRequest -Uri "$RawBase/install.ps1" -OutFile $temp -UseBasicParsing
+
+        if (-not (Test-Path $temp) -or (Get-Item $temp).Length -lt 1000) {
+            throw 'Update download failed.'
+        }
+
+        Copy-Item -LiteralPath $temp -Destination $ScriptPath -Force
+        Remove-Item -LiteralPath $temp -Force
+        Write-Info 'Updated.'
+    }
+
+    'help' {
+        Show-Help
+    }
+
+    'uninstall' {
+        Remove-Item -LiteralPath $StartupPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Info 'Uninstalled.'
+    }
+
     default {
-        Write-Output 'Usage: fsociety on|off|status|set|update|uninstall'
+        Show-Help
     }
-}
-'@
-
-$controlText = $controlText.Replace('__RAW_BASE__', $RawBase)
-Set-Content -LiteralPath $Monitor -Value $monitorText -Encoding UTF8
-Set-Content -LiteralPath $Control -Value $controlText -Encoding UTF8
-
-@'
-@echo off
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\1234\control.ps1" %*
-'@ | Set-Content -LiteralPath $Shim -Encoding ASCII
-
-# Register per-user startup; no administrator privileges are required.
-$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-New-Item -Path $runKey -Force | Out-Null
-Set-ItemProperty -Path $runKey -Name '1234Wallpaper' -Value "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Monitor`""
-
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-$pathParts = @()
-if ($userPath) { $pathParts = @($userPath -split ';' | Where-Object { $_ }) }
-if ($pathParts -notcontains $Bin) {
-    $pathParts += $Bin
-    [Environment]::SetEnvironmentVariable('Path', ($pathParts -join ';'), 'User')
-}
-
-Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$Monitor`"")
-if ($Update) {
-    Write-Output 'fsociety updated. Existing enabled/disabled setting was preserved.'
-} else {
-    Write-Output 'fsociety installed and enabled. Open a NEW Terminal window, then use: fsociety on/off/status/update/uninstall'
 }
