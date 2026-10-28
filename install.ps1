@@ -1,3 +1,4 @@
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -17,32 +18,57 @@ $DaemonMode = $Arguments -contains '-Daemon'
 $NormalArgs = @($Arguments | Where-Object { $_ -ne '-Daemon' })
 $Command = 'install'
 $Value = $null
+$ExtraValue = $null
 
 if ($NormalArgs.Count -gt 0) { $Command = [string]$NormalArgs[0] }
 if ($NormalArgs.Count -gt 1) { $Value = [string]$NormalArgs[1] }
+if ($NormalArgs.Count -gt 2) { $ExtraValue = [string]$NormalArgs[2] }
 
 function Get-Config {
     if (Test-Path -LiteralPath $ConfigPath) {
         try {
             $c = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+
+            $updateMinutes = 360
+            if ($null -ne $c.updateMinutes) {
+                $updateMinutes = [Math]::Max(1, [int]$c.updateMinutes)
+            }
+
             return @{
                 interval = [Math]::Max(1, [int]$c.interval)
                 enabled = [bool]$c.enabled
+                updateMinutes = $updateMinutes
             }
         } catch {}
     }
 
-    return @{ interval = 1; enabled = $true }
+    return @{
+        interval = 1
+        enabled = $true
+        updateMinutes = 360
+    }
 }
 
 function Save-Config {
-    param([int]$Interval, [bool]$Enabled)
+    param(
+        [int]$Interval,
+        [bool]$Enabled,
+        [int]$UpdateMinutes = 360
+    )
 
     if ($Interval -lt 1) {
-        throw 'The interval must be at least one second.'
+        throw 'The wallpaper interval must be at least one second.'
     }
 
-    @{ interval = $Interval; enabled = $Enabled } |
+    if ($UpdateMinutes -lt 1) {
+        throw 'The update interval must be at least one minute.'
+    }
+
+    @{
+        interval = $Interval
+        enabled = $Enabled
+        updateMinutes = $UpdateMinutes
+    } |
         ConvertTo-Json |
         Set-Content -LiteralPath $ConfigPath -Encoding UTF8
 }
@@ -56,7 +82,7 @@ function Test-Png {
 
     try {
         $bytes = [System.IO.File]::ReadAllBytes($Path)
-        $signature = @(137,80,78,71,13,10,26,10)
+        $signature = @(137, 80, 78, 71, 13, 10, 26, 10)
 
         if ($bytes.Length -lt 8) { return $false }
 
@@ -299,11 +325,11 @@ function Run-Daemon {
     Set-Content -LiteralPath $PidPath -Value $PID -Encoding ASCII
 
     $lastUpdateCheck = Get-Date
-    $updateInterval = 21600
 
     try {
         while ($true) {
             $c = Get-Config
+
             if (!$c.enabled) { break }
 
             if (Test-Png -Path $WallpaperPath) {
@@ -316,8 +342,11 @@ function Run-Daemon {
                 } catch {}
             }
 
-            if (((Get-Date) - $lastUpdateCheck).TotalSeconds -ge $updateInterval) {
+            # The update interval is stored in minutes.
+            # Read the configuration on every loop so changes take effect.
+            if (((Get-Date) - $lastUpdateCheck).TotalMinutes -ge $c.updateMinutes) {
                 $lastUpdateCheck = Get-Date
+
                 if (Update-InBackground) { break }
             }
 
@@ -343,7 +372,7 @@ function Install-Fs {
     Download-Assets
 
     if (!(Test-Path -LiteralPath $ConfigPath)) {
-        Save-Config -Interval 1 -Enabled $true
+        Save-Config -Interval 1 -Enabled $true -UpdateMinutes 360
     }
 
     Set-Command
@@ -374,6 +403,33 @@ function Update-Fs {
     Write-Host 'Update complete.'
 }
 
+function Set-UpdateTime {
+    param([string]$Minutes)
+
+    $parsedMinutes = 0
+
+    if (
+        [string]::IsNullOrWhiteSpace($Minutes) -or
+        ![int]::TryParse($Minutes, [ref]$parsedMinutes) -or
+        $parsedMinutes -lt 1
+    ) {
+        throw 'Usage: fs update time <minutes>, with a whole number of at least 1.'
+    }
+
+    $c = Get-Config
+
+    Save-Config `
+        -Interval $c.interval `
+        -Enabled $c.enabled `
+        -UpdateMinutes $parsedMinutes
+
+    if ($c.enabled) {
+        Start-Daemon
+    }
+
+    Write-Host "Automatic update interval set to $parsedMinutes minute(s)."
+}
+
 function Uninstall-Fs {
     Stop-Daemon
     Remove-Startup
@@ -399,21 +455,24 @@ try {
             'install' {
                 Install-Fs
             }
+
             'on' {
                 $c = Get-Config
-                Save-Config -Interval $c.interval -Enabled $true
+                Save-Config -Interval $c.interval -Enabled $true -UpdateMinutes $c.updateMinutes
                 Set-Startup
                 Set-Wallpaper
                 Start-Daemon
                 Write-Host 'Enforcement enabled.'
             }
+
             'off' {
                 $c = Get-Config
-                Save-Config -Interval $c.interval -Enabled $false
+                Save-Config -Interval $c.interval -Enabled $false -UpdateMinutes $c.updateMinutes
                 Stop-Daemon
                 Remove-Startup
                 Write-Host 'Enforcement disabled.'
             }
+
             'status' {
                 $c = Get-Config
                 $running = $false
@@ -426,30 +485,48 @@ try {
                 }
 
                 Write-Host "Enabled: $($c.enabled)"
-                Write-Host "Interval: $($c.interval) second(s)"
+                Write-Host "Wallpaper interval: $($c.interval) second(s)"
+                Write-Host "Automatic update interval: $($c.updateMinutes) minute(s)"
                 Write-Host "Background process running: $running"
                 Write-Host "Wallpaper exists: $(Test-Png -Path $WallpaperPath)"
             }
+
             'set' {
                 Set-Wallpaper
                 Write-Host 'Wallpaper applied.'
             }
+
             'time' {
                 $seconds = 0
 
-                if (!$Value -or ![int]::TryParse($Value, [ref]$seconds) -or $seconds -lt 1) {
+                if (
+                    !$Value -or
+                    ![int]::TryParse($Value, [ref]$seconds) -or
+                    $seconds -lt 1
+                ) {
                     throw 'Usage: fs time <seconds>, with a whole number of at least 1.'
                 }
 
                 $c = Get-Config
-                Save-Config -Interval $seconds -Enabled $c.enabled
+
+                Save-Config `
+                    -Interval $seconds `
+                    -Enabled $c.enabled `
+                    -UpdateMinutes $c.updateMinutes
+
                 if ($c.enabled) { Start-Daemon }
 
-                Write-Host "Interval set to $seconds second(s)."
+                Write-Host "Wallpaper interval set to $seconds second(s)."
             }
+
             'update' {
-                Update-Fs
+                if ($Value -and $Value.ToLowerInvariant() -eq 'time') {
+                    Set-UpdateTime -Minutes $ExtraValue
+                } else {
+                    Update-Fs
+                }
             }
+
             'help' {
                 Write-Host 'fs install'
                 Write-Host 'fs on'
@@ -458,12 +535,15 @@ try {
                 Write-Host 'fs set'
                 Write-Host 'fs time <seconds>'
                 Write-Host 'fs update'
+                Write-Host 'fs update time <minutes>'
                 Write-Host 'fs help'
                 Write-Host 'fs uninstall'
             }
+
             'uninstall' {
                 Uninstall-Fs
             }
+
             default {
                 throw "Unknown command '$Command'. Run fs help."
             }
