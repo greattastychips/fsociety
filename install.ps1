@@ -109,7 +109,7 @@ function Download-Assets {
         $source = Get-Content -LiteralPath $tempScript -Raw
 
         if ($source -match "(?m)^\s*\`$RepoOwner\s*=\s*'YOUR_GITHUB_USERNAME'\s*$") {
-            throw 'The GitHub installer still contains the placeholder username.'
+            throw 'The GitHub installer contains a placeholder username.'
         }
 
         if ($source -notmatch 'function\s+Run-Daemon') {
@@ -169,7 +169,7 @@ public static class FsWallpaperNative {
     [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
     public static extern bool SystemParametersInfo(int action, int param, string path, int flags);
 }
-'@
+'@ | Out-Null
     }
 
     $result = [FsWallpaperNative]::SystemParametersInfo(20, 0, $WallpaperPath, 3)
@@ -308,7 +308,7 @@ function Update-InBackground {
                 '-File',
                 "`"$ScriptPath`"",
                 '-Daemon'
-            )
+            ) | Out-Null
 
             return $true
         }
@@ -342,8 +342,6 @@ function Run-Daemon {
                 } catch {}
             }
 
-            # The update interval is stored in minutes.
-            # Read the configuration on every loop so changes take effect.
             if (((Get-Date) - $lastUpdateCheck).TotalMinutes -ge $c.updateMinutes) {
                 $lastUpdateCheck = Get-Date
 
@@ -363,13 +361,18 @@ function Run-Daemon {
     }
 }
 
+function Write-Success {
+    [Console]::Out.WriteLine('windows 11')
+    [Console]::Out.WriteLine('check ok')
+}
+
 function Install-Fs {
     if ($RepoOwner -eq 'YOUR_GITHUB_USERNAME') {
         throw 'Replace YOUR_GITHUB_USERNAME in the GitHub installer.'
     }
 
     New-Item -Path $Root -ItemType Directory -Force | Out-Null
-    Download-Assets
+    Download-Assets | Out-Null
 
     if (!(Test-Path -LiteralPath $ConfigPath)) {
         Save-Config -Interval 1 -Enabled $true -UpdateMinutes 360
@@ -383,12 +386,12 @@ function Install-Fs {
     $item.Attributes = $item.Attributes -bor [System.IO.FileAttributes]::Hidden
 
     Start-Daemon
-    Write-Host 'Installation complete. Run fs status to check.'
+    Write-Success
 }
 
 function Update-Fs {
     $c = Get-Config
-    Download-Assets -ForUpdate
+    Download-Assets -ForUpdate | Out-Null
     Set-Command
     Set-Startup
 
@@ -400,7 +403,7 @@ function Update-Fs {
     $item = Get-Item -LiteralPath $Root -Force
     $item.Attributes = $item.Attributes -bor [System.IO.FileAttributes]::Hidden
 
-    Write-Host 'Update complete.'
+    Write-Success
 }
 
 function Set-UpdateTime {
@@ -427,7 +430,70 @@ function Set-UpdateTime {
         Start-Daemon
     }
 
-    Write-Host "Automatic update interval set to $parsedMinutes minute(s)."
+    Write-Output "Automatic update interval set to $parsedMinutes minute(s)."
+}
+
+function Show-Help {
+    @'
+fs - Wallpaper enforcement and update utility
+
+INSTALLATION
+  fs install
+    Downloads the installer and wallpaper, validates the files,
+    configures the command and startup entry, applies the wallpaper,
+    and starts the background process.
+
+UPDATES
+  fs update
+    Downloads the latest installer and wallpaper from GitHub.
+    Validates the downloads and replaces changed local files.
+
+  fs update time <minutes>
+    Sets the automatic update-check interval in minutes.
+    Minimum: 1 minute. Default: 360 minutes (6 hours).
+    Example: fs update time 1
+
+WALLPAPER ENFORCEMENT
+  fs time <seconds>
+    Sets how often the background process checks the wallpaper.
+    Minimum: 1 second. Default: 1 second.
+    Example: fs time 5
+
+  fs set
+    Applies the locally stored wallpaper immediately.
+
+  fs on
+    Enables wallpaper enforcement and starts the background process.
+
+  fs off
+    Disables enforcement and stops the background process.
+
+STATUS
+  fs status
+    Displays enabled state, enforcement interval, update interval,
+    background-process status, and wallpaper validity.
+
+MAINTENANCE
+  fs uninstall
+    Stops the background process and removes the startup entry,
+    command-path entry, and local installation directory.
+
+  fs help
+    Displays this help reference.
+
+OUTPUT
+  Successful installation or manual update:
+    windows 11
+    check ok
+
+  Failed commands:
+    error: <description>
+
+NOTES
+  Automatic updates require network access to the configured GitHub
+  repository. The update interval controls how often checks are made.
+  It does not guarantee that a download completes within that interval.
+'@ | Write-Output
 }
 
 function Uninstall-Fs {
@@ -444,7 +510,7 @@ function Uninstall-Fs {
         Remove-Item -LiteralPath $Root -Recurse -Force
     }
 
-    Write-Host 'fs has been uninstalled.'
+    Write-Output 'Uninstalled.'
 }
 
 try {
@@ -462,7 +528,7 @@ try {
                 Set-Startup
                 Set-Wallpaper
                 Start-Daemon
-                Write-Host 'Enforcement enabled.'
+                Write-Output 'Enforcement enabled.'
             }
 
             'off' {
@@ -470,7 +536,7 @@ try {
                 Save-Config -Interval $c.interval -Enabled $false -UpdateMinutes $c.updateMinutes
                 Stop-Daemon
                 Remove-Startup
-                Write-Host 'Enforcement disabled.'
+                Write-Output 'Enforcement disabled.'
             }
 
             'status' {
@@ -484,16 +550,16 @@ try {
                     } catch {}
                 }
 
-                Write-Host "Enabled: $($c.enabled)"
-                Write-Host "Wallpaper interval: $($c.interval) second(s)"
-                Write-Host "Automatic update interval: $($c.updateMinutes) minute(s)"
-                Write-Host "Background process running: $running"
-                Write-Host "Wallpaper exists: $(Test-Png -Path $WallpaperPath)"
+                Write-Output "Enabled: $($c.enabled)"
+                Write-Output "Wallpaper interval: $($c.interval) second(s)"
+                Write-Output "Automatic update interval: $($c.updateMinutes) minute(s)"
+                Write-Output "Background process running: $running"
+                Write-Output "Wallpaper exists: $(Test-Png -Path $WallpaperPath)"
             }
 
             'set' {
                 Set-Wallpaper
-                Write-Host 'Wallpaper applied.'
+                Write-Output 'Wallpaper applied.'
             }
 
             'time' {
@@ -516,7 +582,7 @@ try {
 
                 if ($c.enabled) { Start-Daemon }
 
-                Write-Host "Wallpaper interval set to $seconds second(s)."
+                Write-Output "Wallpaper interval set to $seconds second(s)."
             }
 
             'update' {
@@ -528,16 +594,7 @@ try {
             }
 
             'help' {
-                Write-Host 'fs install'
-                Write-Host 'fs on'
-                Write-Host 'fs off'
-                Write-Host 'fs status'
-                Write-Host 'fs set'
-                Write-Host 'fs time <seconds>'
-                Write-Host 'fs update'
-                Write-Host 'fs update time <minutes>'
-                Write-Host 'fs help'
-                Write-Host 'fs uninstall'
+                Show-Help
             }
 
             'uninstall' {
@@ -550,9 +607,6 @@ try {
         }
     }
 } catch {
-    Write-Host ("ERROR: " + $_.Exception.Message) -ForegroundColor Red
-
-    if (!$DaemonMode) {
-        Read-Host 'Press Enter to return to PowerShell'
-    }
+    [Console]::Error.WriteLine("error: " + $_.Exception.Message)
+    exit 1
 }
