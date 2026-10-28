@@ -1,544 +1,479 @@
-
-param(
-    [Parameter(Position = 0)]
-    [string]$Command = 'install',
-
-    [Parameter(Position = 1)]
-    [string]$Value
-)
-
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
 $RepoOwner = 'greattastychips'
-$RepoName = 'fsociety'
-$Branch = 'main'
-
-$InstallDir = Join-Path $env:LOCALAPPDATA '1234'
-$ScriptPath = Join-Path $InstallDir 'install.ps1'
-$WallpaperPath = Join-Path $InstallDir '1234.png'
-$ConfigPath = Join-Path $InstallDir 'config.json'
-$ShimPath = Join-Path $InstallDir 'fsociety.cmd'
+$RepoUrl = "https://raw.githubusercontent.com/$RepoOwner/fsociety/main"
+$InstallRoot = Join-Path $env:LOCALAPPDATA '1234'
+$ScriptPath = Join-Path $InstallRoot 'install.ps1'
+$WallpaperPath = Join-Path $InstallRoot '1234.png'
+$ConfigPath = Join-Path $InstallRoot 'config.json'
+$PidPath = Join-Path $InstallRoot 'daemon.pid'
 $LogPath = Join-Path $env:TEMP 'fsociety-install.log'
-
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $RunName = 'fsociety'
-$MutexName = 'Local\fsociety_1234_mutex'
-$StopEventName = 'Local\fsociety_1234_stop'
+$PowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
-$ScriptUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/install.ps1"
-$WallpaperUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/1234.png"
+$ScriptArgs = @($args)
+$IsDaemon = $ScriptArgs -contains '-Daemon'
+$Command = 'install'
+$Value = $null
 
-$PowerShellExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+if ($ScriptArgs.Count -gt 0) {
+    $NormalArgs = @($ScriptArgs | Where-Object { $_ -ne '-Daemon' })
+    if ($NormalArgs.Count -gt 0) {
+        $Command = [string]$NormalArgs[0]
+    }
+    if ($NormalArgs.Count -gt 1) {
+        $Value = [string]$NormalArgs[1]
+    }
+}
 
-function Log {
+try {
+    if (!(Test-Path $env:TEMP)) {
+        throw 'The temporary directory is unavailable.'
+    }
+    if (!(Test-Path $LogPath)) {
+        New-Item -Path $LogPath -ItemType File -Force | Out-Null
+    }
+}
+catch {
+    Write-Host "Could not initialize logging: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+function Write-Log {
     param([string]$Message)
 
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
+    $Line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
+    Write-Host $Line
 
     try {
-        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
-    } catch {}
-
-    Write-Host $Message
-}
-
-function Step {
-    param([string]$Message, [int]$Percent)
-
-    Write-Progress -Activity 'fsociety' -Status $Message -PercentComplete $Percent
-    Log "[$Percent%] $Message"
-}
-
-function Ensure-Repo {
-    if ($RepoOwner -eq 'YOUR_GITHUB_USERNAME') {
-        throw 'Set $RepoOwner in install.ps1 to your GitHub username before uploading it.'
+        Add-Content -LiteralPath $LogPath -Value $Line -ErrorAction Stop
+    }
+    catch {
+        Write-Host "Could not write to log: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 
-function Test-Png {
-    param([string]$Path)
-
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return $false
-    }
-
-    $stream = $null
-
-    try {
-        $stream = [System.IO.File]::OpenRead($Path)
-
-        if ($stream.Length -lt 100) {
-            return $false
-        }
-
-        $sig = New-Object byte[] 8
-        [void]$stream.Read($sig, 0, 8)
-
-        $expected = [byte[]](137, 80, 78, 71, 13, 10, 26, 10)
-
-        for ($i = 0; $i -lt 8; $i++) {
-            if ($sig[$i] -ne $expected[$i]) {
-                return $false
-            }
-        }
-
-        return $true
-    } catch {
-        return $false
-    } finally {
-        if ($null -ne $stream) {
-            $stream.Dispose()
-        }
-    }
-}
-
-function Read-Config {
+function Get-Config {
     if (Test-Path -LiteralPath $ConfigPath) {
         try {
-            $c = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
-            $interval = [int]$c.IntervalSeconds
-
-            if ($interval -lt 1 -or $interval -gt 3600) {
-                $interval = 1
+            $Data = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+            $Interval = [int]$Data.interval
+            if ($Interval -lt 1) {
+                $Interval = 1
             }
 
             return @{
-                IntervalSeconds = $interval
-                Enabled = [bool]$c.Enabled
+                interval = $Interval
+                enabled = [bool]$Data.enabled
             }
-        } catch {}
+        }
+        catch {
+            Write-Log "Configuration could not be read: $($_.Exception.Message)"
+        }
     }
 
-    return @{ IntervalSeconds = 1; Enabled = $true }
+    return @{
+        interval = 1
+        enabled = $true
+    }
 }
 
-function Write-Config {
-    param([int]$IntervalSeconds, [bool]$Enabled)
+function Save-Config {
+    param(
+        [int]$Interval,
+        [bool]$Enabled
+    )
 
-    if ($IntervalSeconds -lt 1 -or $IntervalSeconds -gt 3600) {
-        throw 'Interval must be between 1 and 3600 seconds.'
+    if ($Interval -lt 1) {
+        throw 'The interval must be at least one second.'
     }
 
-    @{
-        IntervalSeconds = $IntervalSeconds
-        Enabled = $Enabled
-    } | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
+    $Data = @{
+        interval = $Interval
+        enabled = $Enabled
+    }
+
+    $Data | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
 }
 
-function Stop-Daemon {
+function Download-Files {
+    Write-Log 'Downloading installer and wallpaper from GitHub.'
+
+    $TempScript = Join-Path $env:TEMP "fsociety-$([guid]::NewGuid().ToString('N')).ps1"
+    $TempWallpaper = Join-Path $env:TEMP "fsociety-$([guid]::NewGuid().ToString('N')).png"
+
     try {
-        $ev = [System.Threading.EventWaitHandle]::OpenExisting($StopEventName)
-        [void]$ev.Set()
-        $ev.Dispose()
-    } catch {}
+        Invoke-WebRequest -Uri "$RepoUrl/install.ps1" -OutFile $TempScript -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest -Uri "$RepoUrl/1234.png" -OutFile $TempWallpaper -UseBasicParsing -ErrorAction Stop
 
-    for ($i = 0; $i -lt 30; $i++) {
-        $m = $null
+        $Source = Get-Content -LiteralPath $TempScript -Raw
+        if ($Source -notmatch '(?m)^\s*\$RepoOwner\s*=\s*''[^'']+''\s*$') {
+            throw 'The downloaded installer has no valid RepoOwner assignment.'
+        }
 
-        try {
-            $m = [System.Threading.Mutex]::OpenExisting($MutexName)
-            $acquired = $false
+        if ($Source -match "(?m)^\s*`$RepoOwner\s*=\s*'YOUR_GITHUB_USERNAME'\s*$") {
+            throw 'Replace YOUR_GITHUB_USERNAME in install.ps1, commit the change, and try again.'
+        }
 
-            try {
-                $acquired = $m.WaitOne(100)
-            } catch [System.Threading.AbandonedMutexException] {
-                $acquired = $true
-            }
+        $Bytes = [System.IO.File]::ReadAllBytes($TempWallpaper)
+        $Signature = @(137, 80, 78, 71, 13, 10, 26, 10)
 
-            if ($acquired) {
-                $m.ReleaseMutex()
-                return
-            }
-        } catch [System.Threading.WaitHandleCannotBeOpenedException] {
-            return
-        } catch {
-        } finally {
-            if ($null -ne $m) {
-                $m.Dispose()
+        if ($Bytes.Length -lt 8) {
+            throw 'The downloaded wallpaper is empty or incomplete.'
+        }
+
+        for ($i = 0; $i -lt 8; $i++) {
+            if ($Bytes[$i] -ne $Signature[$i]) {
+                throw 'GitHub did not return a valid PNG. Check that 1234.png exists at the repository root.'
             }
         }
 
-        Start-Sleep -Milliseconds 100
+        if (!(Test-Path -LiteralPath $InstallRoot)) {
+            New-Item -Path $InstallRoot -ItemType Directory -Force | Out-Null
+        }
+
+        Move-Item -LiteralPath $TempScript -Destination $ScriptPath -Force
+        Move-Item -LiteralPath $TempWallpaper -Destination $WallpaperPath -Force
+
+        Write-Log 'Installer and wallpaper downloaded successfully.'
     }
-
-    Log 'Warning: background process did not confirm shutdown in time.'
-}
-
-function Apply-Wallpaper {
-    if (-not (Test-Png $WallpaperPath)) {
-        throw 'Wallpaper file is missing or invalid. Run fsociety update.'
-    }
-
-    if (-not ('FsocietyNative' -as [type])) {
-        Add-Type -TypeDefinition @"
-using System.Runtime.InteropServices;
-public class FsocietyNative {
-    [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
-    public static extern bool SystemParametersInfo(int action, int param, string path, int flags);
-}
-"@
-    }
-
-    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $WallpaperPath
-
-    if (-not [FsocietyNative]::SystemParametersInfo(20, 0, $WallpaperPath, 3)) {
-        throw 'Windows could not apply the wallpaper.'
+    finally {
+        Remove-Item -LiteralPath $TempScript, $TempWallpaper -Force -ErrorAction SilentlyContinue
     }
 }
 
-function Register-Startup {
-    if (-not (Test-Path $RunKey)) {
+function Set-HiddenFolder {
+    if (Test-Path -LiteralPath $InstallRoot) {
+        $Item = Get-Item -LiteralPath $InstallRoot -Force
+        $Item.Attributes = $Item.Attributes -bor [System.IO.FileAttributes]::Hidden
+    }
+}
+
+function Set-UserPath {
+    $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $Parts = @($UserPath -split ';' | Where-Object { $_ })
+
+    if (!($Parts | Where-Object { $_.TrimEnd('\') -ieq $InstallRoot.TrimEnd('\') })) {
+        $NewPath = (($Parts + $InstallRoot) -join ';')
+        [Environment]::SetEnvironmentVariable('Path', $NewPath, 'User')
+    }
+
+    if (!($env:Path -split ';' | Where-Object { $_.TrimEnd('\') -ieq $InstallRoot.TrimEnd('\') })) {
+        $env:Path = "$InstallRoot;$env:Path"
+    }
+}
+
+function Remove-UserPath {
+    $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $Parts = @($UserPath -split ';' | Where-Object {
+        $_ -and $_.TrimEnd('\') -ine $InstallRoot.TrimEnd('\')
+    })
+
+    [Environment]::SetEnvironmentVariable('Path', ($Parts -join ';'), 'User')
+}
+
+function Write-CommandShim {
+    $ShimPath = Join-Path $InstallRoot 'fsociety.cmd'
+    $Shim = "@echo off`r`n`"$PowerShellExe`" -NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`" %*`r`n"
+    Set-Content -LiteralPath $ShimPath -Value $Shim -Encoding ASCII
+}
+
+function Set-Startup {
+    if (!(Test-Path $RunKey)) {
         New-Item -Path $RunKey -Force | Out-Null
     }
 
-    $cmd = '"' + $PowerShellExe + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ScriptPath + '" -Daemon'
-
-    Set-ItemProperty -Path $RunKey -Name $RunName -Value $cmd
+    $StartupCommand = '"' + $PowerShellExe + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ScriptPath + '" -Daemon'
+    Set-ItemProperty -Path $RunKey -Name $RunName -Value $StartupCommand
 }
 
-function Unregister-Startup {
+function Remove-Startup {
     if (Test-Path $RunKey) {
         Remove-ItemProperty -Path $RunKey -Name $RunName -ErrorAction SilentlyContinue
     }
 }
 
-function Add-PathEntry {
-    $entries = @(
-        [Environment]::GetEnvironmentVariable('Path', 'User') -split ';' |
-        Where-Object { $_ }
-    )
-
-    if (-not ($entries | Where-Object {
-        $_.TrimEnd('\') -ieq $InstallDir.TrimEnd('\')
-    })) {
-        $entries += $InstallDir
-        [Environment]::SetEnvironmentVariable('Path', ($entries -join ';'), 'User')
+function Set-WallpaperNow {
+    if (!(Test-Path -LiteralPath $WallpaperPath)) {
+        throw "Wallpaper not found: $WallpaperPath"
     }
 
-    $env:Path = "$InstallDir;$env:Path"
+    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $WallpaperPath
+    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value '10'
+    Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value '0'
+
+    $NativeCode = @'
+using System;
+using System.Runtime.InteropServices;
+public static class FsocietyWallpaperNative {
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    public static extern bool SystemParametersInfo(int action, int param, string path, int flags);
+}
+'@
+
+    if (!('FsocietyWallpaperNative' -as [type])) {
+        Add-Type -TypeDefinition $NativeCode -ErrorAction Stop
+    }
+
+    $Result = [FsocietyWallpaperNative]::SystemParametersInfo(20, 0, $WallpaperPath, 3)
+
+    if (!$Result) {
+        throw "Windows rejected the wallpaper update. Win32 error: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    }
 }
 
-function Remove-PathEntry {
-    $userEntries = @(
-        [Environment]::GetEnvironmentVariable('Path', 'User') -split ';' |
-        Where-Object {
-            $_ -and $_.TrimEnd('\') -ine $InstallDir.TrimEnd('\')
+function Stop-Daemon {
+    if (Test-Path -LiteralPath $PidPath) {
+        try {
+            $DaemonId = [int](Get-Content -LiteralPath $PidPath -Raw).Trim()
+            $Process = Get-Process -Id $DaemonId -ErrorAction SilentlyContinue
+
+            if ($Process -and $DaemonId -ne $PID) {
+                Stop-Process -Id $DaemonId -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 300
+            }
         }
-    )
-
-    [Environment]::SetEnvironmentVariable('Path', ($userEntries -join ';'), 'User')
-
-    $env:Path = (@(
-        $env:Path -split ';' |
-        Where-Object {
-            $_ -and $_.TrimEnd('\') -ine $InstallDir.TrimEnd('\')
+        catch {
+            Write-Log "Could not stop the previous daemon: $($_.Exception.Message)"
         }
-    ) -join ';')
-}
 
-function Download-Files {
-    param([string]$TempScript, [string]$TempPng)
-
-    Ensure-Repo
-
-    Step 'Downloading wallpaper from GitHub' 20
-    Invoke-WebRequest -Uri $WallpaperUrl -OutFile $TempPng -UseBasicParsing -ErrorAction Stop
-
-    if (-not (Test-Png $TempPng)) {
-        throw 'GitHub did not return a valid PNG. Upload 1234.png to the repository root on the main branch.'
-    }
-
-    Step 'Downloading installer from GitHub' 40
-    Invoke-WebRequest -Uri $ScriptUrl -OutFile $TempScript -UseBasicParsing -ErrorAction Stop
-
-    $source = Get-Content -LiteralPath $TempScript -Raw
-
-    if ($source -notmatch 'function Install-Fsociety') {
-        throw 'The repository install.ps1 is not the expected installer. Check the uploaded file and branch.'
-    }
-
-    if ($source -match 'YOUR_GITHUB_USERNAME') {
-        throw 'Replace YOUR_GITHUB_USERNAME in the repository copy before installing.'
+        Remove-Item -LiteralPath $PidPath -Force -ErrorAction SilentlyContinue
     }
 }
 
 function Start-Daemon {
     Stop-Daemon
 
-    $args = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ScriptPath + '" -Daemon'
-    Start-Process -FilePath $PowerShellExe -ArgumentList $args -WindowStyle Hidden
+    $StartupCommand = '"' + $PowerShellExe + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ScriptPath + '" -Daemon'
+    $Process = Start-Process -FilePath $PowerShellExe -ArgumentList @(
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-WindowStyle',
+        'Hidden',
+        '-File',
+        "`"$ScriptPath`"",
+        '-Daemon'
+    ) -PassThru -WindowStyle Hidden
+
+    Start-Sleep -Milliseconds 700
+
+    if ($Process.HasExited) {
+        throw "The background daemon exited immediately. Check $LogPath for details."
+    }
+
+    Write-Log "Background daemon started with PID $($Process.Id)."
 }
 
-function Install-Fsociety {
-    $temp = Join-Path $env:TEMP ('fsociety-' + [guid]::NewGuid().ToString('N'))
+function Run-Daemon {
+    Set-Content -LiteralPath $PidPath -Value $PID -Encoding ASCII
+    Write-Log "Daemon started. PID: $PID"
 
     try {
-        New-Item -ItemType Directory -Path $temp -Force | Out-Null
-
-        $tempScript = Join-Path $temp 'install.ps1'
-        $tempPng = Join-Path $temp '1234.png'
-
-        Step 'Checking configuration' 5
-        Download-Files -TempScript $tempScript -TempPng $tempPng
-
-        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-
-        Step 'Stopping old background process' 50
-        Stop-Daemon
-
-        Step 'Installing files' 65
-        Copy-Item -LiteralPath $tempScript -Destination $ScriptPath -Force
-        Copy-Item -LiteralPath $tempPng -Destination $WallpaperPath -Force
-
-        Write-Config -IntervalSeconds 1 -Enabled $true
-
-        @(
-            '@echo off'
-            '"' + $PowerShellExe + '" -NoProfile -ExecutionPolicy Bypass -File "' + $ScriptPath + '" %*'
-        ) | Set-Content -LiteralPath $ShimPath -Encoding ASCII
-
-        Add-PathEntry
-
-        try {
-            $folder = Get-Item -LiteralPath $InstallDir -Force
-            $folder.Attributes = $folder.Attributes -bor [System.IO.FileAttributes]::Hidden
-        } catch {}
-
-        Step 'Registering sign-in startup' 80
-        Register-Startup
-
-        Step 'Applying wallpaper' 90
-        Apply-Wallpaper
-
-        Step 'Starting wallpaper enforcement' 97
-        Start-Daemon
-
-        Write-Progress -Activity 'fsociety' -Completed
-        Log 'Installation completed successfully.'
-        Write-Host 'Open a new PowerShell window to use the fsociety command.'
-    } finally {
-        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-function Update-Fsociety {
-    if (-not (Test-Path -LiteralPath $InstallDir)) {
-        throw 'fsociety is not installed. Run fsociety install.'
-    }
-
-    $temp = Join-Path $env:TEMP ('fsociety-update-' + [guid]::NewGuid().ToString('N'))
-
-    try {
-        New-Item -ItemType Directory -Path $temp -Force | Out-Null
-
-        $tempScript = Join-Path $temp 'install.ps1'
-        $tempPng = Join-Path $temp '1234.png'
-
-        Download-Files -TempScript $tempScript -TempPng $tempPng
-        $config = Read-Config
-
-        Stop-Daemon
-
-        Copy-Item -LiteralPath $tempScript -Destination $ScriptPath -Force
-        Copy-Item -LiteralPath $tempPng -Destination $WallpaperPath -Force
-
-        Write-Config -IntervalSeconds $config.IntervalSeconds -Enabled $config.Enabled
-
-        if ($config.Enabled) {
-            Apply-Wallpaper
-            Register-Startup
-            Start-Daemon
-        } else {
-            Unregister-Startup
-        }
-
-        Log 'Update completed; settings preserved.'
-    } finally {
-        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-function Set-FsocietyEnabled {
-    param([bool]$Enabled)
-
-    if (-not (Test-Path -LiteralPath $ConfigPath)) {
-        throw 'fsociety is not installed. Run fsociety install.'
-    }
-
-    $c = Read-Config
-    Write-Config -IntervalSeconds $c.IntervalSeconds -Enabled $Enabled
-
-    if ($Enabled) {
-        Register-Startup
-        Apply-Wallpaper
-        Start-Daemon
-        Log 'Enforcement enabled.'
-    } else {
-        Unregister-Startup
-        Stop-Daemon
-        Log 'Enforcement disabled.'
-    }
-}
-
-function Show-FsocietyStatus {
-    $c = Read-Config
-
-    Write-Host "Installed: $(Test-Path -LiteralPath $ScriptPath)"
-    Write-Host "Wallpaper valid: $(Test-Png $WallpaperPath)"
-    Write-Host "Enabled: $($c.Enabled)"
-    Write-Host "Interval: $($c.IntervalSeconds) second(s)"
-}
-
-function Uninstall-Fsociety {
-    Unregister-Startup
-    Stop-Daemon
-    Remove-PathEntry
-
-    if (Test-Path -LiteralPath $InstallDir) {
-        Remove-Item -LiteralPath $InstallDir -Recurse -Force
-    }
-
-    Log 'fsociety has been uninstalled.'
-}
-
-function Run-FsocietyDaemon {
-    $mutex = [System.Threading.Mutex]::new($false, $MutexName)
-    $owns = $false
-    $event = $null
-
-    try {
-        try {
-            $owns = $mutex.WaitOne(0)
-        } catch [System.Threading.AbandonedMutexException] {
-            $owns = $true
-        }
-
-        if (-not $owns) {
-            return
-        }
-
-        $event = [System.Threading.EventWaitHandle]::new(
-            $false,
-            [System.Threading.EventResetMode]::AutoReset,
-            $StopEventName
-        )
-
         while ($true) {
-            $c = Read-Config
+            $Config = Get-Config
 
-            if (-not $c.Enabled) {
+            if (!$Config.enabled) {
+                Write-Log 'Enforcement is disabled; daemon is stopping.'
                 break
             }
 
             try {
-                $current = (Get-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper -ErrorAction SilentlyContinue).Wallpaper
+                $CurrentWallpaper = (Get-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper -ErrorAction SilentlyContinue).Wallpaper
 
-                if ($current -ine $WallpaperPath) {
-                    Apply-Wallpaper
+                if ($CurrentWallpaper -ine $WallpaperPath) {
+                    Set-WallpaperNow
+                    Write-Log 'Wallpaper restored.'
                 }
-            } catch {}
+            }
+            catch {
+                Write-Log "Wallpaper enforcement error: $($_.Exception.Message)"
+            }
 
-            if ($event.WaitOne([int]($c.IntervalSeconds * 1000))) {
-                break
+            Start-Sleep -Seconds ([Math]::Max(1, [int]$Config.interval))
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $PidPath) {
+            $StoredPid = (Get-Content -LiteralPath $PidPath -Raw -ErrorAction SilentlyContinue).Trim()
+            if ($StoredPid -eq [string]$PID) {
+                Remove-Item -LiteralPath $PidPath -Force -ErrorAction SilentlyContinue
             }
         }
-    } finally {
-        if ($null -ne $event) {
-            $event.Dispose()
-        }
 
-        if ($owns) {
-            try { $mutex.ReleaseMutex() } catch {}
-        }
-
-        $mutex.Dispose()
+        Write-Log 'Daemon stopped.'
     }
 }
 
-try {
-    if ($Command -eq '-Daemon') {
-        Run-FsocietyDaemon
-        return
+function Install-Fsociety {
+    Write-Log 'Starting installation.'
+
+    if ($RepoOwner -eq 'YOUR_GITHUB_USERNAME') {
+        throw 'Edit install.ps1 on GitHub and replace YOUR_GITHUB_USERNAME with your GitHub username.'
     }
 
-    switch ($Command.ToLowerInvariant()) {
-        'install' {
-            Install-Fsociety
-        }
+    New-Item -Path $InstallRoot -ItemType Directory -Force | Out-Null
+    Download-Files
 
-        'on' {
-            Set-FsocietyEnabled -Enabled $true
-        }
+    if (!(Test-Path -LiteralPath $ConfigPath)) {
+        Save-Config -Interval 1 -Enabled $true
+    }
 
-        'off' {
-            Set-FsocietyEnabled -Enabled $false
-        }
+    Write-CommandShim
+    Set-UserPath
+    Set-Startup
+    Set-HiddenFolder
+    Set-WallpaperNow
+    Start-Daemon
 
-        'status' {
-            Show-FsocietyStatus
-        }
+    Write-Log 'Installation completed.'
+    Write-Host "Type fsociety status to check the installation."
+    Write-Host "Log file: $LogPath"
+}
 
-        'set' {
-            if ($Value) {
-                if (-not (Test-Png $Value)) {
-                    throw 'The specified file is not a valid PNG.'
+function Show-Status {
+    $Config = Get-Config
+    $WallpaperExists = Test-Path -LiteralPath $WallpaperPath
+    $DaemonRunning = $false
+
+    if (Test-Path -LiteralPath $PidPath) {
+        try {
+            $DaemonId = [int](Get-Content -LiteralPath $PidPath -Raw).Trim()
+            $DaemonRunning = [bool](Get-Process -Id $DaemonId -ErrorAction SilentlyContinue)
+        }
+        catch {
+            $DaemonRunning = $false
+        }
+    }
+
+    Write-Host "Enabled: $($Config.enabled)"
+    Write-Host "Interval: $($Config.interval) second(s)"
+    Write-Host "Daemon running: $DaemonRunning"
+    Write-Host "Wallpaper exists: $WallpaperExists"
+    Write-Host "Install folder: $InstallRoot"
+    Write-Host "Log file: $LogPath"
+}
+
+function Update-Fsociety {
+    Write-Log 'Updating installer and wallpaper.'
+    $Config = Get-Config
+
+    Download-Files
+    Write-CommandShim
+    Set-Startup
+    Set-HiddenFolder
+
+    if ($Config.enabled) {
+        Set-WallpaperNow
+        Start-Daemon
+    }
+
+    Write-Log 'Update completed. Configuration preserved.'
+}
+
+function Uninstall-Fsociety {
+    Write-Log 'Uninstalling fsociety.'
+
+    Stop-Daemon
+    Remove-Startup
+    Remove-UserPath
+
+    if (Test-Path -LiteralPath $InstallRoot) {
+        $Item = Get-Item -LiteralPath $InstallRoot -Force
+        $Item.Attributes = [System.IO.FileAttributes]::Directory
+        Remove-Item -LiteralPath $InstallRoot -Recurse -Force
+    }
+
+    Write-Log 'Uninstall completed.'
+    Write-Host 'The fsociety files, startup entry, and user PATH entry have been removed.'
+}
+
+try {
+    if ($IsDaemon) {
+        Run-Daemon
+    }
+    else {
+        switch ($Command.ToLowerInvariant()) {
+            'install' {
+                Install-Fsociety
+            }
+            'on' {
+                if (!(Test-Path -LiteralPath $ScriptPath)) {
+                    throw 'fsociety is not installed. Run the installer first.'
                 }
 
-                Copy-Item -LiteralPath $Value -Destination $WallpaperPath -Force
-            }
-
-            Apply-Wallpaper
-            Log 'Wallpaper applied.'
-        }
-
-        'time' {
-            $seconds = 0
-
-            if (-not [int]::TryParse($Value, [ref]$seconds)) {
-                throw 'Usage: fsociety time <seconds>'
-            }
-
-            if ($seconds -lt 1 -or $seconds -gt 3600) {
-                throw 'Interval must be between 1 and 3600 seconds.'
-            }
-
-            $c = Read-Config
-            Write-Config -IntervalSeconds $seconds -Enabled $c.Enabled
-
-            if ($c.Enabled) {
+                $Config = Get-Config
+                Save-Config -Interval $Config.interval -Enabled $true
+                Set-Startup
+                Set-WallpaperNow
                 Start-Daemon
+                Write-Log 'Enforcement enabled.'
             }
+            'off' {
+                $Config = Get-Config
+                Save-Config -Interval $Config.interval -Enabled $false
+                Stop-Daemon
+                Remove-Startup
+                Write-Log 'Enforcement disabled.'
+            }
+            'status' {
+                Show-Status
+            }
+            'set' {
+                Set-WallpaperNow
+                Write-Log 'Wallpaper applied.'
+            }
+            'time' {
+                if (!$Value) {
+                    throw 'Usage: fsociety time <seconds>'
+                }
 
-            Log "Interval set to $seconds second(s)."
-        }
+                $Seconds = 0
+                if (![int]::TryParse($Value, [ref]$Seconds) -or $Seconds -lt 1) {
+                    throw 'The interval must be a whole number of at least 1 second.'
+                }
 
-        'update' {
-            Update-Fsociety
-        }
+                $Config = Get-Config
+                Save-Config -Interval $Seconds -Enabled $Config.enabled
 
-        'uninstall' {
-            Uninstall-Fsociety
-        }
+                if ($Config.enabled) {
+                    Start-Daemon
+                }
 
-        'help' {
-            Write-Host 'fsociety install'
-            Write-Host 'fsociety on'
-            Write-Host 'fsociety off'
-            Write-Host 'fsociety status'
-            Write-Host 'fsociety set'
-            Write-Host 'fsociety set "C:\path\image.png"'
-            Write-Host 'fsociety time 20'
-            Write-Host 'fsociety update'
-            Write-Host 'fsociety uninstall'
-            Write-Host 'fsociety help'
-        }
-
-        default {
-            throw "Unknown command '$Command'. Use fsociety help."
+                Write-Log "Enforcement interval set to $Seconds second(s)."
+            }
+            'update' {
+                Update-Fsociety
+            }
+            'help' {
+                Write-Host 'fsociety install'
+                Write-Host 'fsociety on'
+                Write-Host 'fsociety off'
+                Write-Host 'fsociety status'
+                Write-Host 'fsociety set'
+                Write-Host 'fsociety time <seconds>'
+                Write-Host 'fsociety update'
+                Write-Host 'fsociety help'
+                Write-Host 'fsociety uninstall'
+            }
+            'uninstall' {
+                Uninstall-Fsociety
+            }
+            default {
+                throw "Unknown command: $Command. Run fsociety help."
+            }
         }
     }
-} catch {
-    Write-Progress -Activity 'fsociety' -Completed
-    Log "ERROR: $($_.Exception.Message)"
-    Write-Host "Log file: $LogPath" -ForegroundColor Yellow
+}
+catch {
+    $Message = $_.Exception.Message
+    Write-Log "ERROR: $Message"
+    Write-Host ''
+    Write-Host "INSTALL/COMMAND FAILED: $Message" -ForegroundColor Red
+    Write-Host "Log location: $LogPath" -ForegroundColor Yellow
+
+    if (!$IsDaemon) {
+        Read-Host 'Press Enter to return to PowerShell'
+    }
 }
