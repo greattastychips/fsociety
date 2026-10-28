@@ -1,6 +1,5 @@
 
 param(
-    [switch]$Update,
     [switch]$Daemon
 )
 
@@ -16,32 +15,26 @@ $WallpaperPath = Join-Path $InstallDir '1234.png'
 $ScriptPath = Join-Path $InstallDir 'fsociety.ps1'
 $ConfigPath = Join-Path $InstallDir 'config.json'
 $CommandPath = Join-Path $InstallDir 'fsociety.cmd'
-$StartupDir = [Environment]::GetFolderPath('Startup')
-$StartupPath = Join-Path $StartupDir 'fsociety.cmd'
+$StartupPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'fsociety-startup.cmd'
+$DaemonMutexName = 'Local\fsociety-wallpaper-daemon'
+$StopEventName = 'Local\fsociety-wallpaper-stop'
 
 function Write-Info([string]$Message) {
-    Write-Host "[fsociety] $Message"
+    Write-Output "[fsociety] $Message"
 }
 
 function Get-Config {
-    $defaults = @{
-        Enabled = $true
-        Interval = 1
-    }
+    $config = @{ Enabled = $true; Interval = 1 }
 
     if (Test-Path $ConfigPath) {
         try {
             $saved = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-            if ($null -ne $saved.Enabled) {
-                $defaults.Enabled = [bool]$saved.Enabled
-            }
-            if ($null -ne $saved.Interval) {
-                $defaults.Interval = [Math]::Max(1, [int]$saved.Interval)
-            }
+            $config.Enabled = [bool]$saved.Enabled
+            $config.Interval = [Math]::Max(1, [int]$saved.Interval)
         } catch {}
     }
 
-    return $defaults
+    return $config
 }
 
 function Save-Config($Config) {
@@ -53,18 +46,21 @@ function Set-Wallpaper([string]$Path) {
         throw "Wallpaper file not found: $Path"
     }
 
-    Add-Type @'
+    if (-not ('FsocietyWallpaperApi' -as [type])) {
+        Add-Type @'
 using System;
 using System.Runtime.InteropServices;
-public class WallpaperApi {
+public class FsocietyWallpaperApi {
     [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
     public static extern int SystemParametersInfo(
         int action, int param, string path, int flags
     );
 }
-'@ -ErrorAction SilentlyContinue
+'@
+    }
 
-    $result = [WallpaperApi]::SystemParametersInfo(20, 0, $Path, 3)
+    $result = [FsocietyWallpaperApi]::SystemParametersInfo(20, 0, $Path, 3)
+
     if ($result -eq 0) {
         throw 'Windows could not apply the wallpaper.'
     }
@@ -72,56 +68,127 @@ public class WallpaperApi {
 
 function Get-CurrentWallpaper {
     try {
-        Get-ItemPropertyValue -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper
+        return Get-ItemPropertyValue -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper
     } catch {
         return ''
     }
 }
 
-function Download-Wallpaper {
-    Invoke-WebRequest -Uri $WallpaperUrl -OutFile $WallpaperPath -UseBasicParsing
+function Download-File([string]$Url, [string]$Destination) {
+    Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing
 
-    if (-not (Test-Path $WallpaperPath) -or (Get-Item $WallpaperPath).Length -lt 1024) {
-        throw 'Wallpaper download failed or returned an invalid file.'
+    if (-not (Test-Path $Destination) -or (Get-Item $Destination).Length -lt 1000) {
+        throw "Download failed: $Url"
+    }
+}
+
+function Stop-Daemon {
+    try {
+        $event = [Threading.EventWaitHandle]::OpenExisting($StopEventName)
+        $null = $event.Set()
+        $event.Dispose()
+    } catch {}
+
+    Start-Sleep -Milliseconds 500
+}
+
+function Start-Daemon {
+    $mutex = New-Object Threading.Mutex($false, $DaemonMutexName)
+    $ownsMutex = $false
+
+    try {
+        try {
+            $ownsMutex = $mutex.WaitOne(0)
+        } catch [Threading.AbandonedMutexException] {
+            $ownsMutex = $true
+        }
+
+        if (-not $ownsMutex) {
+            return
+        }
+
+        $stopEvent = New-Object Threading.EventWaitHandle(
+            $false,
+            [Threading.EventResetMode]::ManualReset,
+            $StopEventName
+        )
+        $stopEvent.Reset()
+
+        try {
+            while ($true) {
+                if (Test-Path (Join-Path $InstallDir 'stop.flag')) {
+                    break
+                }
+
+                $config = Get-Config
+
+                if ($config.Enabled) {
+                    try {
+                        if ((Get-CurrentWallpaper) -ne $WallpaperPath) {
+                            Set-Wallpaper $WallpaperPath
+                        }
+                    } catch {}
+                }
+
+                if ($stopEvent.WaitOne([Math]::Max(1, $config.Interval) * 1000)) {
+                    break
+                }
+            }
+        } finally {
+            $stopEvent.Dispose()
+        }
+    } finally {
+        if ($ownsMutex) {
+            $mutex.ReleaseMutex()
+        }
+
+        $mutex.Dispose()
     }
 }
 
 function Install-Utility {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    Remove-Item (Join-Path $InstallDir 'stop.flag') -Force -ErrorAction SilentlyContinue
 
     $folder = Get-Item $InstallDir
     $folder.Attributes = $folder.Attributes -bor [IO.FileAttributes]::Hidden
 
-    if (-not (Test-Path $WallpaperPath)) {
-        Download-Wallpaper
+    $tempScript = Join-Path $env:TEMP 'fsociety-install.ps1'
+    $tempWallpaper = Join-Path $env:TEMP 'fsociety-wallpaper.png'
+
+    Download-File "$RawBase/install.ps1" $tempScript
+    Download-File $WallpaperUrl $tempWallpaper
+
+    Copy-Item $tempScript $ScriptPath -Force
+    Copy-Item $tempWallpaper $WallpaperPath -Force
+
+    Remove-Item $tempScript, $tempWallpaper -Force -ErrorAction SilentlyContinue
+
+    if (-not (Test-Path $ConfigPath)) {
+        Save-Config @{ Enabled = $true; Interval = 1 }
     }
-
-    if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
-        Copy-Item -LiteralPath $PSCommandPath -Destination $ScriptPath -Force
-    }
-
-    $config = Get-Config
-    Save-Config $config
-
-    @'
-@echo off
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%LOCALAPPDATA%\1234\fsociety.ps1" -Daemon
-'@ | Set-Content -Path $StartupPath -Encoding ASCII
 
     @'
 @echo off
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\1234\fsociety.ps1" %*
 '@ | Set-Content -Path $CommandPath -Encoding ASCII
 
+    @'
+@echo off
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%LOCALAPPDATA%\1234\fsociety.ps1" -Daemon
+'@ | Set-Content -Path $StartupPath -Encoding ASCII
+
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if (($userPath -split ';') -notcontains $InstallDir) {
-        $newPath = (@($userPath.TrimEnd(';'), $InstallDir) | Where-Object { $_ }) -join ';'
-        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+    $paths = @($userPath -split ';' | Where-Object { $_ })
+
+    if (-not ($paths | Where-Object { $_.TrimEnd('\') -ieq $InstallDir.TrimEnd('\') })) {
+        $paths += $InstallDir
+        [Environment]::SetEnvironmentVariable('Path', ($paths -join ';'), 'User')
     }
 
     Set-Wallpaper $WallpaperPath
 
-    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
         '-NoLogo',
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
@@ -129,32 +196,31 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\
         '-Daemon'
     )
 
-    Write-Info 'Installed.'
+    Write-Info 'Installed successfully.'
 }
 
-function Start-Daemon {
-    $mutex = New-Object Threading.Mutex($false, 'Local\fsociety-wallpaper-daemon')
-    if (-not $mutex.WaitOne(0)) {
-        return
-    }
+function Update-Utility {
+    $temp = Join-Path $env:TEMP 'fsociety-update.ps1'
 
     try {
-        while ($true) {
-            $config = Get-Config
+        Download-File "$RawBase/install.ps1" $temp
 
-            if ($config.Enabled) {
-                try {
-                    if ((Get-CurrentWallpaper) -ne $WallpaperPath) {
-                        Set-Wallpaper $WallpaperPath
-                    }
-                } catch {}
-            }
+        $tokens = $null
+        $parseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseFile(
+            $temp,
+            [ref]$tokens,
+            [ref]$parseErrors
+        ) | Out-Null
 
-            Start-Sleep -Seconds ([Math]::Max(1, $config.Interval))
+        if ($parseErrors.Count -gt 0) {
+            throw 'The downloaded update contains PowerShell syntax errors.'
         }
+
+        Copy-Item -LiteralPath $temp -Destination $ScriptPath -Force
+        Write-Info 'Update installed. Your settings were preserved.'
     } finally {
-        $mutex.ReleaseMutex()
-        $mutex.Dispose()
+        Remove-Item $temp -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -189,14 +255,14 @@ switch ($command.ToLowerInvariant()) {
         $config.Enabled = $true
         Save-Config $config
         Set-Wallpaper $WallpaperPath
-        Write-Info 'Enabled.'
+        Write-Info 'Wallpaper enforcement enabled.'
     }
 
     'off' {
         $config = Get-Config
         $config.Enabled = $false
         Save-Config $config
-        Write-Info 'Disabled.'
+        Write-Info 'Wallpaper enforcement disabled.'
     }
 
     'status' {
@@ -214,8 +280,7 @@ switch ($command.ToLowerInvariant()) {
 
     'time' {
         if ($args.Count -lt 2) {
-            Write-Output 'Usage: fsociety time <seconds>'
-            exit 1
+            throw 'Usage: fsociety time <seconds>'
         }
 
         $seconds = 0
@@ -230,16 +295,7 @@ switch ($command.ToLowerInvariant()) {
     }
 
     'update' {
-        $temp = Join-Path $env:TEMP 'fsociety-update.ps1'
-        Invoke-WebRequest -Uri "$RawBase/install.ps1" -OutFile $temp -UseBasicParsing
-
-        if (-not (Test-Path $temp) -or (Get-Item $temp).Length -lt 1000) {
-            throw 'Update download failed.'
-        }
-
-        Copy-Item -LiteralPath $temp -Destination $ScriptPath -Force
-        Remove-Item -LiteralPath $temp -Force
-        Write-Info 'Updated.'
+        Update-Utility
     }
 
     'help' {
@@ -247,9 +303,20 @@ switch ($command.ToLowerInvariant()) {
     }
 
     'uninstall' {
+        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+        New-Item -ItemType File -Path (Join-Path $InstallDir 'stop.flag') -Force | Out-Null
+        Stop-Daemon
+
         Remove-Item -LiteralPath $StartupPath -Force -ErrorAction SilentlyContinue
+
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $paths = @($userPath -split ';' | Where-Object {
+            $_ -and $_.TrimEnd('\') -ine $InstallDir.TrimEnd('\')
+        })
+        [Environment]::SetEnvironmentVariable('Path', ($paths -join ';'), 'User')
+
         Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Info 'Uninstalled.'
+        Write-Info 'Uninstalled. The current wallpaper was left unchanged.'
     }
 
     default {
